@@ -34,82 +34,74 @@ def LossPredLoss(input, target, margin=1.0, reduction='mean'):
 
 
 def test(models, dataloaders, mode='val'):
-    assert mode == 'val' or mode == 'test'
+    assert mode in ['val', 'test']
     models['backbone'].eval()
+    models['module'].eval()
 
     total = 0
     correct = 0
     with torch.no_grad():
         for (inputs, labels) in dataloaders[mode]:
-            inputs = inputs.cuda()
-            labels = labels.cuda()
+            with torch.cuda.device(CUDA_VISIBLE_DEVICES):
+                inputs = inputs.cuda()
+                labels = labels.cuda()
 
-            scores = models['backbone'](inputs)[0]
+            scores, _, _ = models['backbone'](inputs)
+
             _, preds = torch.max(scores.data, 1)
             total += labels.size(0)
             correct += (preds == labels).sum().item()
 
     return 100 * correct / total
 
-iters = 0
-def train_epoch(models, criterion, optimizers, dataloaders, epoch, epoch_loss):
+
+def train_epoch(models, criterion, optimizers, dataloaders, epoch):
     models['backbone'].train()
     models['module'].train()
-    global iters
-    direc = None
 
-    for inputs, labels, _, _ in dataloaders['train']:
-        inputs = inputs.cuda()
-        labels = labels.cuda()
+    for data in tqdm(dataloaders['train'], leave=False, total=len(dataloaders['train'])):
+        with torch.cuda.device(CUDA_VISIBLE_DEVICES):
+            inputs = data[0].cuda()
+            labels = data[1].cuda()
+            index = data[2].detach().numpy().tolist()
 
-        # Zero gradients
         optimizers['backbone'].zero_grad()
         optimizers['module'].zero_grad()
 
-        # Forward pass
-        scores, _, _, features = models['backbone'](inputs)
-        target_loss = criterion(scores, labels)
+        scores, emb, features = models['backbone'](inputs)
+        target_loss = criterion['CE'](scores, labels)
+        probs = torch.softmax(scores, dim=1)
+        moving_prob = data[3].cuda()
+        moving_prob = (moving_prob * epoch + probs * 1) / (epoch + 1)
+        dataloaders['train'].dataset.moving_prob[index, :] = moving_prob.cpu().detach().numpy()
 
-        if epoch > epoch_loss:
-            features[0] = features[0].detach()
-            features[1] = features[1].detach()
-            features[2] = features[2].detach()
-            features[3] = features[3].detach()
-        pred_loss = models['module'](features)
-        pred_loss = pred_loss.view(pred_loss.size(0))
-
-        # Compute losses
+        cumulative_logit = models['module'](features)
+        m_module_loss = criterion['KL_Div'](F.log_softmax(cumulative_logit, 1), moving_prob.detach())
         m_backbone_loss = torch.sum(target_loss) / target_loss.size(0)
-        m_module_loss = LossPredLoss(pred_loss, target_loss, margin=MARGIN)
         loss = m_backbone_loss + WEIGHT * m_module_loss
-
         loss.backward()
-        # 收集最后一层的梯度
-        gradients = [param.grad.flatten() for param in models['backbone'].parameters() if param.grad is not None]
-        direc = torch.cat(gradients) if gradients else None
 
-        # Step optimizers
         optimizers['backbone'].step()
         optimizers['module'].step()
 
-    return direc
+    return loss
 
 
-def train(models, criterion, optimizers, schedulers,  dataloaders, num_epochs, cycle, epoch_loss):
-    print('>> Training the model...')
+def train(models, criterion, optimizers, schedulers, dataloaders, num_epochs):
+    print('>> Train a Model.')
     best_acc = 0.
-    direc = None
 
     for epoch in range(num_epochs):
-        direc = train_epoch(models, criterion, optimizers, dataloaders, epoch, epoch_loss)
+
+        best_loss = torch.tensor([0.5]).cuda()
+        loss = train_epoch(models, criterion, optimizers, dataloaders, epoch)
+
         schedulers['backbone'].step()
         schedulers['module'].step()
-        # Save a checkpoint
-        if epoch % 20 == 0 or epoch == 199:
-            acc = test(models, dataloaders, 'test')
+
+        if False and epoch % 20 == 7:
+            acc = test(models, dataloaders, mode='test')
             if best_acc < acc:
                 best_acc = acc
-            print('Cycle:', cycle, 'Epoch:', epoch, '---','Val Acc: {:.3f} \t Best Acc: {:.3f}'.format(acc, best_acc), flush=True)
+                print('Val Acc: {:.3f} \t Best Acc: {:.3f}'.format(acc, best_acc))
     print('>> Finished.')
-    return direc
-

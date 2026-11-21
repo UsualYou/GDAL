@@ -5,36 +5,38 @@ import numpy as np
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+import torch.optim.lr_scheduler as lr_scheduler
 from torch.utils.data.sampler import SubsetRandomSampler
 import argparse
 import os
-import torch.optim.lr_scheduler as lr_scheduler
+
 # Custom
 import models.resnet as resnet
 from models.query_models import TDNet
-from models.opt import GDSGD
 from train_test.train_test import train, test
 from data.load_dataset import load_dataset
 from methods.selection_methods import query_samples
 from config import *
+from models.opt import GDSGD
 
 parser = argparse.ArgumentParser()
 parser.add_argument("-d", "--dataset", type=str, default="cifar10",
                     help="cifar10 / cifar100")
 parser.add_argument("-i", "--imb_factor", type=int, default=1,
                     help="1 / 10 / 100")
+parser.add_argument("--init_dist", type=str, default='random',
+                    help="uniform / random.")
 parser.add_argument("-c", "--cycles", type=int, default=10,
                     help="Number of active learning cycles")
 parser.add_argument("-t", "--total", type=bool, default=False,
                     help="Training on the entire dataset")
-parser.add_argument("--seed", type=int, default=0,
+parser.add_argument("--seed", type=int, default=42,
                     help="Training seed.")
 parser.add_argument("--subset", type=int, default=5000,
                     help="The size of subset.")
 parser.add_argument("-w", "--num_workers", type=str, default=0,
                     help="The number of workers.")
-parser.add_argument("--init_dist", type=str, default='random',
-                    help="uniform / random.")
+
 args = parser.parse_args()
 
 # Seed
@@ -65,9 +67,14 @@ args.initial_size = args.add_num
 # Main
 if __name__ == '__main__':
     datasets = ['cifar10', 'cifar100']
+    assert args.dataset in datasets, 'No dataset %s! Try options %s' % (args.dataset, datasets)
+    '''
+    method_type: 'Random', 'Entropy', 'CoreSet', 'lloss', 'TiDAL'
+    '''
     os.makedirs('../results', exist_ok=True)
-    txt_name = f'../results/results1_{args.dataset}_{str(args.imb_factor)}.txt'
+    txt_name = f'../results/results3_{args.dataset}_{str(args.imb_factor)}.txt'
     results = open(txt_name, 'w')
+
     print(txt_name)
     print("Dataset: %s" % args.dataset)
     if args.total:
@@ -82,35 +89,55 @@ if __name__ == '__main__':
         print('The entire datasize is {}'.format(len(data_train)))
         NUM_TRAIN = no_train
         indices = list(range(NUM_TRAIN))
-        random.shuffle(indices)
-        labeled_set = indices[:args.initial_size]
-        unlabeled_set = [x for x in indices if x not in labeled_set]
+
+        if args.total:
+            labeled_set = indices
+        else:
+            random.shuffle(indices)
+            labeled_set = indices[:args.add_num]
+            unlabeled_set = [x for x in indices if x not in labeled_set]
+
+        train_loader = DataLoader(data_train, batch_size=BATCH,
+                                  sampler=SubsetRandomSampler(labeled_set),
+                                  pin_memory=True, num_workers=args.num_workers)
+        test_loader = DataLoader(data_test, batch_size=BATCH,
+                                 pin_memory=True, num_workers=args.num_workers)
+        dataloaders = {'train': train_loader, 'test': test_loader}
 
         # Model - create new instance for every trial so that it resets
-        resnet_ = resnet.ResNet18(NUM_CLASS).cuda()
-        out_dim = NO_CLASSES
-        pred_module = TDNet(out_dim=NUM_CLASS).cuda()
+        with torch.cuda.device(CUDA_VISIBLE_DEVICES):
+            resnet_ = resnet.ResNet18(num_classes=NO_CLASSES)
+            out_dim = NO_CLASSES
+            pred_module = TDNet(out_dim=out_dim)
         models = {'backbone': resnet_, 'module': pred_module}
-        torch.backends.cudnn.benchmark = True
+
+        criterion = {}
+        criterion['CE'] = nn.CrossEntropyLoss(reduction='none')
+        criterion['KL_Div'] = nn.KLDivLoss(reduction='batchmean')
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        for key, val in models.items():
+            models[key] = models[key].to(device)
 
         for cycle in range(CYCLES):
-            train_loader = DataLoader(data_train, batch_size=BATCH,
-                                      sampler=SubsetRandomSampler(labeled_set),
-                                      pin_memory=True)
-            test_loader = DataLoader(data_test, batch_size=BATCH,
-                                     pin_memory=True)
-            dataloaders = {'train': train_loader, 'test': test_loader}
-            criterion = nn.CrossEntropyLoss(reduction='none')
+            # Randomly sample 10000 unlabeled data points
+            if not args.total:
+                random.shuffle(unlabeled_set)
+                subset = unlabeled_set[:args.subset]
+
+            torch.backends.cudnn.benchmark = True
             optim_backbone = GDSGD(models['backbone'].parameters(), lr=LR, momentum=MOMENTUM, weight_decay=WDECAY)
-            optim_module = GDSGD(models['module'].parameters(), lr=LR, momentum=MOMENTUM, weight_decay=WDECAY)
             sched_backbone = lr_scheduler.MultiStepLR(optim_backbone, milestones=MILESTONES)
+            optim_module = GDSGD(models['module'].parameters(), lr=LR, momentum=MOMENTUM, weight_decay=WDECAY)
             sched_module = lr_scheduler.MultiStepLR(optim_module, milestones=MILESTONES)
             optimizers = {'backbone': optim_backbone, 'module': optim_module}
             schedulers = {'backbone': sched_backbone, 'module': sched_module}
+
             # Training and testing
-            direc = train(models, criterion, optimizers, schedulers, dataloaders, EPOCH, cycle, EPOCHL)
+            train(models, criterion, optimizers, schedulers, dataloaders, EPOCH)
             acc = test(models, dataloaders, mode='test')
-            print('Trial {}/{} || Cycle {}/{} || Label set size {}: Test acc {}'.format(trial + 1, TRIALS, cycle + 1,CYCLES, len(labeled_set), acc))
+            print('Trial {}/{} || Cycle {}/{} || Label set size {}: Test acc {}'.format(trial + 1, TRIALS, cycle + 1,
+                                                                                        CYCLES, len(labeled_set), acc))
             np.array([trial + 1, TRIALS, cycle + 1, CYCLES, len(labeled_set), acc]).tofile(results, sep=" ")
             results.write("\n")
 
@@ -119,12 +146,14 @@ if __name__ == '__main__':
                 print("Finished.")
                 break
             # Get the indices of the unlabeled samples to train on next cycle
-            random.shuffle(unlabeled_set)
-            subset = unlabeled_set[:args.subset]
-            arg = query_samples(models, data_unlabeled, subset, direc)
-            new_list = list(torch.tensor(subset)[arg][-args.add_num:].numpy())
-            labeled_set += new_list
-            unlabeled_set = [x for x in indices if x not in labeled_set]
+            arg = query_samples(models, data_unlabeled, subset, args)
+
+            # Update the labeled dataset and the unlabeled dataset, respectively
+            new_list = list(torch.tensor(subset)[arg][:args.add_num].numpy())
+
+            labeled_set += list(torch.tensor(subset)[arg][-args.add_num:].numpy())
+            listd = list(torch.tensor(subset)[arg][:-args.add_num].numpy())
+            unlabeled_set = listd + unlabeled_set[args.subset:]
             print(len(labeled_set), min(labeled_set), max(labeled_set))
 
             # Create a new dataloader for the updated labeled dataset

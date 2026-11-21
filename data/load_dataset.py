@@ -5,7 +5,7 @@ from torchvision.datasets import CIFAR100, CIFAR10
 
 from config import *
 from utils.make_imbalance import *
-
+import random
 
 class MyDataset(Dataset):
     def __init__(self, dataset_name, train_flag=None, transf=None, args=None):
@@ -19,10 +19,10 @@ class MyDataset(Dataset):
             torch.backends.cudnn.deterministic = True
 
         if self.dataset_name == "cifar10":
-            self.dataset = CIFAR10('./data', train=train_flag,
+            self.dataset = CIFAR10('../cifar10', train=train_flag,
                                    download=True, transform=transf)
         elif self.dataset_name == "cifar100":
-            self.dataset = CIFAR100('./data', train=train_flag,
+            self.dataset = CIFAR100('../cifar100', train=train_flag,
                                     download=True, transform=transf)
 
         if args is not None:
@@ -79,44 +79,41 @@ def sync_dataset(labeled_set, unlabeled_set):
 # Data
 def load_dataset(args):
     dataset = args.dataset
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = True
 
-    if dataset == 'cifar10':
-        train_transform = T.Compose([
-            T.RandomHorizontalFlip(),
-            T.RandomCrop(size=32, padding=4),
-            T.ToTensor(),
-            T.Normalize([0.4914, 0.4822, 0.4465], [0.2023, 0.1994, 0.2010])
-        ])
+    train_transform = T.Compose([
+        T.RandomHorizontalFlip(),
+        T.RandomCrop(size=32, padding=4),
+        T.ToTensor(),
+        T.Normalize([0.4914, 0.4822, 0.4465], [0.2023, 0.1994, 0.2010])
+        # T.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)) # CIFAR-100
+    ])
 
-        test_transform = T.Compose([
-            T.ToTensor(),
-            T.Normalize([0.4914, 0.4822, 0.4465], [0.2023, 0.1994, 0.2010])
-        ])
+    test_transform = T.Compose([
+        T.ToTensor(),
+        T.Normalize([0.4914, 0.4822, 0.4465], [0.2023, 0.1994, 0.2010])
+        # T.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)) # CIFAR-100
+    ])
+
+    if dataset == 'cifar10':
         data_train = MyDataset(dataset, train_flag=True, transf=train_transform, args=args)
         data_unlabeled = MyDataset(dataset, train_flag=True, transf=test_transform)
+        data_unlabeled = sync_dataset(data_train, data_unlabeled)
         data_test = CIFAR10('../cifar10', train=False, download=True, transform=test_transform)
+        data_test.pred_main = np.zeros((len(data_test), EPOCH, 10), dtype=np.float32)
+        data_test.pred_sub = np.zeros((len(data_test), EPOCH, 10), dtype=np.float32)
         NO_CLASSES = 10
         NUM_TRAIN = len(data_train)
         no_train = NUM_TRAIN
 
     elif dataset == 'cifar100':
-        train_transform = T.Compose([
-            T.RandomHorizontalFlip(),
-            T.RandomCrop(size=32, padding=4),
-            T.ToTensor(),
-            T.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)) # CIFAR-100
-        ])
-
-        test_transform = T.Compose([
-            T.ToTensor(),
-            T.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)) # CIFAR-100
-        ])
         data_train = MyDataset(dataset, train_flag=True, transf=train_transform, args=args)
         data_unlabeled = MyDataset(dataset, train_flag=True, transf=test_transform)
+        data_unlabeled = sync_dataset(data_train, data_unlabeled)
         data_test = CIFAR100('../cifar100', train=False, download=True, transform=test_transform)
         NO_CLASSES = 100
         NUM_TRAIN = len(data_train)
@@ -124,3 +121,5 @@ def load_dataset(args):
 
     adden = args.add_num
     return data_train, data_unlabeled, data_test, adden, NO_CLASSES, no_train
+
+
